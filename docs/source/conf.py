@@ -8,7 +8,8 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.abspath("../../sycamore"))
+sys.path.insert(0, os.path.abspath("./"))
+sys.path.insert(1, os.path.abspath("../../sycamore/"))
 
 project = "Sycamore"
 copyright = "2023, Aryn Inc."
@@ -21,6 +22,7 @@ extensions = [
     "myst_parser",
     "sphinx.ext.autodoc",
     "sphinx.ext.napoleon",
+    "sphinx.ext.doctest",
     "sphinx.ext.autodoc.typehints",
     "sphinx.ext.autosummary",
     "sphinx.ext.viewcode",
