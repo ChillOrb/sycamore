@@ -5,11 +5,11 @@ from typing import Any, Optional
 from bs4 import BeautifulSoup
 from ray.data import Dataset
 
-from sycamore.functions import TokenOverlapChunker, Chunker
+from sycamore.functions import TextOverlapChunker, Chunker
 from sycamore.functions import CharacterTokenizer, Tokenizer
 from sycamore.data.document import TableElement
 from sycamore.functions import reorder_elements
-from sycamore.data import Document, Element
+from sycamore.data import BoundingBox, Document, Element
 from sycamore.plan_nodes import Node, Transform, SingleThreadUser, NonGPUUser
 from sycamore.transforms.map import generate_map_function
 from sycamore.transforms.extract_table import TableExtractor
@@ -23,9 +23,9 @@ def _elements_reorder_comparator(element1: Element, element2: Element) -> int:
     # following function checks if the x0 point of the element is in the
     # left column
     def element_in_left_col(e: Element) -> bool:
-        width = e.properties["coordinates"]["layout_width"]
-        x0 = e.properties["coordinates"]["points"][0][0]
-        return x0 / width <= 0.5
+        if e.bbox is None:
+            raise RuntimeError("Element BBox is None")
+        return e.bbox.x1 <= 0.5
 
     page1 = element1.properties["page_number"]
     page2 = element2.properties["page_number"]
@@ -44,30 +44,42 @@ def _elements_reorder_comparator(element1: Element, element2: Element) -> int:
 
 
 class Partitioner(ABC):
-    @staticmethod
-    def to_element(dict: dict[str, Any]) -> Element:
-        element = Element()
-        element.type = dict.pop("type")
-        element.binary_representation = dict.pop("text")
-        element.text_representation = str(element.binary_representation)
-        element.properties.update(dict.pop("metadata"))
-        element.properties.update(dict)
-
-        # TODO, we need handle cases of different types for same column
-        if element.properties.get("coordinates") is not None:
-            coordinates = element.properties["coordinates"]
-            if coordinates.get("layout_height") is not None:
-                coordinates["layout_height"] = float(coordinates["layout_height"])
-            if coordinates.get("layout_width") is not None:
-                coordinates["layout_width"] = float(coordinates["layout_width"])
-        return element
-
     @abstractmethod
     def partition(self, document: Document) -> Document:
         pass
 
 
 class UnstructuredPdfPartitioner(Partitioner):
+    """
+    UnstructuredPdfPartitioner utilizes open-source Unstructured library to extract structured elements from
+    unstructured PDFs.
+
+    Args:
+        include_page_breaks: Whether to include page breaks as separate elements.
+        strategy: The partitioning strategy to use ("auto" for automatic detection).
+        infer_table_structure: Whether to infer table structures in the document.
+        ocr_languages: The languages to use for OCR. Default is "eng" (English).
+        max_partition_length: The maximum length of each partition (in characters).
+        include_metadata: Whether to include metadata in the partitioned elements.
+
+    Example:
+         .. code-block:: python
+
+            pdf_partitioner = UnstructuredPdfPartitioner(
+                include_page_breaks=True,
+                strategy="auto",
+                infer_table_structure=True,
+                ocr_languages="eng",
+                max_partition_length=2000,
+                include_metadata=True,
+            )
+
+            context = sycamore.init()
+            pdf_docset = context.read.binary(paths, binary_format="pdf")
+                .partition(partitioner=pdf_partitioner)
+
+    """
+
     def __init__(
         self,
         include_page_breaks: bool = False,
@@ -75,6 +87,7 @@ class UnstructuredPdfPartitioner(Partitioner):
         infer_table_structure: bool = False,
         ocr_languages: str = "eng",
         max_partition_length: Optional[int] = None,
+        min_partition_length: Optional[int] = None,
         include_metadata: bool = True,
     ):
         self._include_page_breaks = include_page_breaks
@@ -82,7 +95,34 @@ class UnstructuredPdfPartitioner(Partitioner):
         self._infer_table_structure = infer_table_structure
         self._ocr_languages = ocr_languages
         self._max_partition_length = max_partition_length
+        self._min_partition_length = min_partition_length
         self._include_metadata = include_metadata
+
+    @staticmethod
+    def to_element(dict: dict[str, Any]) -> Element:
+        text = dict.pop("text")
+        if isinstance(text, str):
+            binary = text.encode("utf-8")
+        else:
+            binary = text
+            text = str(binary, "utf-8")
+
+        element = Element()
+        element.type = dict.pop("type", "unknown")
+        element.binary_representation = binary
+        element.text_representation = text
+        element.properties.update(dict.pop("metadata"))
+        element.properties.update(dict)
+
+        coordinates = element.properties.pop("coordinates")
+        if coordinates is not None:
+            x1 = coordinates.get("points")[0][0] / coordinates.get("layout_width")
+            y1 = coordinates.get("points")[0][1] / coordinates.get("layout_height")
+            x2 = coordinates.get("points")[2][0] / coordinates.get("layout_width")
+            y2 = coordinates.get("points")[2][1] / coordinates.get("layout_height")
+            element.bbox = BoundingBox(x1, y1, x2, y2)
+
+        return element
 
     def partition(self, document: Document) -> Document:
         from unstructured.partition.pdf import partition_pdf
@@ -95,12 +135,13 @@ class UnstructuredPdfPartitioner(Partitioner):
             infer_table_structure=self._infer_table_structure,
             ocr_languages=self._ocr_languages,
             max_partition=self._max_partition_length,
+            min_partition=self._min_partition_length,
             include_metadata=self._include_metadata,
         )
 
         # Here we convert unstructured.io elements into our elements and
         # append them as child elements to the document.  We copy the
-        # document path from parent to children so we can access it
+        # document path from parent to children, so we can access it
         # efficiently at retrieval time.
         inherit_properties = ["path"]
         inherit_dict = {}
@@ -108,10 +149,13 @@ class UnstructuredPdfPartitioner(Partitioner):
             inherit_val = document.properties.get(inherit_property)
             if inherit_val is not None:
                 inherit_dict[inherit_property] = inherit_val
+
+        new_elements = []
         for element in elements:
             new_element = self.to_element(element.to_dict())
             new_element.properties.update(inherit_dict)
-            document.elements.append(new_element)
+            new_elements.append(new_element)
+        document.elements = new_elements
         del elements
 
         document = reorder_elements(document, _elements_reorder_comparator)
@@ -119,18 +163,38 @@ class UnstructuredPdfPartitioner(Partitioner):
 
 
 class HtmlPartitioner(Partitioner):
+    """
+    HtmlPartitioner processes HTML documents extracting structured content.
+
+    Args:
+        skip_headers_and_footers: Whether to skip headers and footers in the document. Default is True.
+        extract_tables: Whether to extract tables from the HTML document. Default is False.
+        text_chunker: The text chunking strategy to use for processing text content.
+        tokenizer: The tokenizer to use for tokenizing text content.
+
+    Example:
+         .. code-block:: python
+
+            html_partitioner = HtmlPartitioner(
+                skip_headers_and_footers=True,
+                extract_tables=True,
+                text_chunker=TokenOverlapChunker(chunk_token_count=1000, chunk_overlap_token_count=100),
+                tokenizer=CharacterTokenizer(),
+            )
+
+            context = sycamore.init()
+            pdf_docset = context.read.binary(paths, binary_format="html")
+                .partition(partitioner=html_partitioner)
+    """
+
     def __init__(
         self,
-        include_page_breaks: bool = False,
         skip_headers_and_footers: bool = True,
-        include_metadata: bool = False,
         extract_tables: bool = False,
-        text_chunker: Chunker = TokenOverlapChunker(),
+        text_chunker: Chunker = TextOverlapChunker(),
         tokenizer: Tokenizer = CharacterTokenizer(),
     ):
-        self._include_page_breaks = include_page_breaks
         self._skip_headers_and_footers = skip_headers_and_footers
-        self._include_metadata = include_metadata
         self._extract_tables = extract_tables
         self._text_chunker = text_chunker
         self._tokenizer = tokenizer
@@ -163,7 +227,6 @@ class HtmlPartitioner(Partitioner):
             element.text_representation = content
             element.properties.update(properties)
             elements += [element]
-        document.elements.extend(elements)
 
         # extract tables
         if self._extract_tables:
@@ -190,13 +253,33 @@ class HtmlPartitioner(Partitioner):
                     if len(cols) > 0:
                         row_vals = [tag.text for tag in cols]
                         table_element.rows += [row_vals]
-
-                document.elements.extend([table_element])
+                elements.append(table_element)
+        document.elements = document.elements + elements
 
         return document
 
 
 class Partition(SingleThreadUser, NonGPUUser, Transform):
+    """
+    The Partition transform segments documents into elements. For example, a typical partitioner might chunk a document
+    into elements corresponding to paragraphs, images, and tables. Partitioners are format specific, so for instance for
+    HTML you can use the HtmlPartitioner and for PDFs, we provide the UnstructuredPdfPartitioner, which utilizes the
+    unstructured open-source library.
+
+    Args:
+        child: The source node or component that provides the dataset to be embedded.
+        partitioner: An instance of a Partitioner class to be applied
+        resource_args: Additional resource-related arguments that can be passed to the Partition operation.
+
+    Example:
+         .. code-block:: python
+
+            source_node = ...  # Define a source node or component that provides a dataset.
+            custom_partitioner = MyPartitioner(partitioner_params)
+            partition_transform = Partition(child=source_node, partitioner=custom_partitioner)
+            partitioned_dataset = partition_transform.execute()
+    """
+
     def __init__(
         self, child: Node, partitioner: Partitioner, table_extractor: Optional[TableExtractor] = None, **resource_args
     ):
